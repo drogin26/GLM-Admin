@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Локальная тестовая среда (PostgreSQL, Redis, uv — НЕ в репозиторий)
+.tools/
+.pgdata/
+*.log
+
+# Секреты
+.env
+
+# Node / Next.js (кабинет)
+node_modules/
+.next/
+out/
+
+# Сборки
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
