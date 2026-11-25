@@ -1,1 +1,6 @@
-"const nextConfig = { output: 'standalone', images: { unoptimized: true } };" 
+const nextConfig = {
+  images: {
+    unoptimized: true,
+  },
+};
+module.exports = nextConfig;
