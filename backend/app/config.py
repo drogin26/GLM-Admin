@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from cryptography.fernet import Fernet
 
 
 class Settings(BaseSettings):
@@ -39,14 +40,13 @@ class Settings(BaseSettings):
     llm_provider: Literal["gigachat", "yandexgpt"] = "gigachat"
     timezone: str = "Europe/Moscow"
 
-    cors_origins: list[str] = Field(default_factory=list)
+    cors_origins_str: str = Field(default="", alias="CORS_ORIGINS")
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def _split_cors(cls, value: object) -> object:
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
+    @property
+    def cors_origins(self) -> list[str]:
+        if not self.cors_origins_str:
+            return []
+        return [item.strip() for item in self.cors_origins_str.split(",") if item.strip()]
 
     @model_validator(mode="after")
     def _validate_secrets(self) -> Settings:
@@ -80,7 +80,21 @@ class Settings(BaseSettings):
 
     @property
     def fernet_key_list(self) -> list[str]:
-        return [key.strip() for key in self.fernet_keys.split(",") if key.strip()]
+        keys = [key.strip() for key in self.fernet_keys.split(",") if key.strip()]
+        if keys:
+            return keys
+        # Если FERNET_KEYS не задан — генерируем временный ключ и предупреждаем.
+        # Это удобно для dev и для first-run, когда .env ещё не заполнен.
+        import warnings
+
+        warnings.warn(
+            "FERNET_KEYS не задан: сгенерирован временный ключ. "
+            "Данные, зашифрованные этим ключом, будут невалидны после перезапуска. "
+            "Добавьте FERNET_KEYS в .env для стабильной работы.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return [Fernet.generate_key().decode()]
 
 
 @lru_cache(maxsize=1)

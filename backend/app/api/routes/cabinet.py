@@ -1,36 +1,14 @@
 """Кабинет: API маршруты для фронтенд Next.js.
-
-Маршруты:
-  POST /api/auth/register  — регистрация нового бизнеса
-  POST /api/auth/login     — вход в кабинет
-  GET  /api/business       — данные текущего бизнеса
-  PUT  /api/business       — обновление настроек
-
-  POST /api/onboarding/step/{step}  — онбординг-визард (шаг за шагом)
-  GET  /api/onboarding/status       — статус прохождения онбординга
-
-  GET  /api/conversations          — список диалогов с фильтрами
-  GET  /api/conversations/{id}     — диалог с сообщениями
-  POST /api/conversations/{id}/reply  — ответ от администратора
-
-  GET  /api/knowledge/docs        — список документов
-  POST /api/knowledge/docs        — загрузка нового документа
-  DELETE /api/knowledge/docs/{id}  — удаление/деактивация
-
-  GET  /api/dashboard            — дашборд с метриками
-  GET  /api/dashboard/lost-leads — отчёт «Потерянные заявки»
-
-  GET  /api/billing/plans        — список тарифов
-  GET  /api/billing/subscription — текущая подписка
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, Form, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.auth import TokenData, create_access_token, get_current_user, LoginRequest
@@ -66,11 +44,10 @@ router = APIRouter(tags=["cabinet"])
 
 @router.post("/auth/register")
 async def register(
-    email: str,
-    password: str,
-    business_name: str,
-    session: AsyncSession = None,  # type: ignore[assignment]
-    user: dict = None,  # type: ignore[assignment]
+    email: str = Form(...),
+    password: str = Form(...),
+    business_name: str = Form(...),
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
     """Регистрация нового бизнеса и пользователя."""
     from sqlalchemy import select
@@ -113,7 +90,7 @@ async def register(
 @router.post("/auth/login")
 async def login(
     request: LoginRequest,
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
     """Вход в кабинет."""
     from app.security import verify_password
@@ -137,7 +114,7 @@ async def login(
 @router.get("/business")
 async def get_business(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Данные текущего бизнеса."""
     business_id = user["business_id"]
@@ -171,7 +148,7 @@ async def get_business(
 async def update_business(
     data: dict,
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Обновление настроек бизнеса."""
     business_id = user["business_id"]
@@ -210,11 +187,14 @@ class OnboardingStepRequest(BaseModel):
 @router.post("/onboarding/step/{step}")
 async def onboarding_step(
     step: str,
-    data: dict = {},
+    body: dict = Body(...),
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Обработка шага онбординга."""
+    from app.config import get_settings
+
+    settings = get_settings()
     business_id = user["business_id"]
     if not business_id:
         raise HTTPException(status_code=400, detail="User not linked to a business")
@@ -223,18 +203,55 @@ async def onboarding_step(
         # Подключение Telegram-бота
         from app.security import encrypt_credentials
 
-        token = data.get("bot_token", "")
+        token = body.get("bot_token", "").strip()
         if not token:
             raise HTTPException(status_code=400, detail="Не указан токен бота")
 
-        channel = Channel(
-            business_id=business_id,
-            type=ChannelType.TELEGRAM,
-            credentials_enc=encrypt_credentials({"token": token}, []),  # type: ignore[arg-type]
-            status=ChannelStatus.ACTIVE,
-            external_id="telegram_bot",
+        # Проверяем токен через Telegram Bot API
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(f"https://api.telegram.org/bot{token}/getMe")
+                if resp.status_code != 200 or not resp.json().get("ok"):
+                    raise HTTPException(status_code=400, detail="Неверный токен Telegram-бота")
+                bot_username = resp.json()["result"].get("username", "unknown")
+        except httpx.ConnectTimeout:
+            raise HTTPException(
+                status_code=503,
+                detail="Не удалось подключиться к Telegram API. Проверьте сетевые настройки Docker.",
+            ) from None
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Ошибка подключения к Telegram API: {exc}",
+            ) from None
+
+        # Проверяем, есть ли уже канал TELEGRAM для этого бизнеса
+        result = await session.execute(
+            select(Channel)
+            .where(Channel.business_id == business_id, Channel.type == ChannelType.TELEGRAM)
+            .limit(1)
         )
-        session.add(channel)
+        existing_channel = result.scalar_one_or_none()
+
+        if existing_channel:
+            # Обновляем существующий канал
+            existing_channel.credentials_enc = encrypt_credentials({"token": token}, settings.fernet_key_list)
+            existing_channel.external_id = bot_username
+            existing_channel.status = ChannelStatus.ACTIVE
+            existing_channel.last_error = None
+            channel = existing_channel
+        else:
+            # Создаём новый канал
+            channel = Channel(
+                business_id=business_id,
+                type=ChannelType.TELEGRAM,
+                credentials_enc=encrypt_credentials({"token": token}, settings.fernet_key_list),
+                status=ChannelStatus.ACTIVE,
+                external_id=bot_username,
+            )
+            session.add(channel)
 
     elif step == "vk":
         # Подключение VK группы
@@ -245,20 +262,33 @@ async def onboarding_step(
         if not token:
             raise HTTPException(status_code=400, detail="Не указан токен группы")
 
-        channel = Channel(
-            business_id=business_id,
-            type=ChannelType.VK,
-            credentials_enc=encrypt_credentials({"token": token, "group_id": group_id}, []),  # type: ignore[arg-type]
-            status=ChannelStatus.ACTIVE,
-            external_id=group_id,
+        result = await session.execute(
+            select(Channel)
+            .where(Channel.business_id == business_id, Channel.type == ChannelType.VK)
+            .limit(1)
         )
+        existing_channel = result.scalar_one_or_none()
+
+        if existing_channel:
+            existing_channel.credentials_enc = encrypt_credentials({"token": token, "group_id": group_id}, settings.fernet_key_list)
+            existing_channel.external_id = group_id
+            existing_channel.status = ChannelStatus.ACTIVE
+            channel = existing_channel
+        else:
+            channel = Channel(
+                business_id=business_id,
+                type=ChannelType.VK,
+                credentials_enc=encrypt_credentials({"token": token, "group_id": group_id}, settings.fernet_key_list),
+                status=ChannelStatus.ACTIVE,
+                external_id=group_id,
+            )
         session.add(channel)
 
     elif step == "mode":
         result = await session.execute(select(Business).where(Business.id == business_id))
         business = result.scalar_one_or_none()
         if business:
-            business.auto_mode = data.get("auto_mode", False)
+            business.auto_mode = body.get("auto_mode", False)
 
     await session.commit()
     return {"status": "ok", "step": step}
@@ -267,7 +297,7 @@ async def onboarding_step(
 @router.get("/onboarding/status")
 async def onboarding_status(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Статус прохождения онбординга."""
     business_id = user["business_id"]
@@ -297,7 +327,7 @@ async def onboarding_status(
 async def list_conversations(
     status_filter: str = "all",  # new, bot, human, closed
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Список диалогов с фильтрами."""
     business_id = user["business_id"]
@@ -336,7 +366,7 @@ async def list_conversations(
 async def get_conversation(
     conv_id: str,
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Диалог с сообщениями."""
     business_id = user["business_id"]
@@ -385,7 +415,7 @@ async def reply_to_conversation(
     conv_id: str,
     data: dict,
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Ответ от администратора (человека)."""
     business_id = user["business_id"]
@@ -429,7 +459,7 @@ async def reply_to_conversation(
 @router.get("/knowledge/docs")
 async def list_knowledge_docs(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Список документов базы знаний."""
     business_id = user["business_id"]
@@ -460,7 +490,7 @@ async def upload_knowledge_doc(
     content: str,
     source_file: str = "",
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Загрузка нового документа."""
     business_id = user["business_id"]
@@ -486,7 +516,7 @@ async def upload_knowledge_doc(
 async def deactivate_knowledge_doc(
     doc_id: str,
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Деактивация документа."""
     doc_uuid = uuid.UUID(doc_id)
@@ -513,7 +543,7 @@ async def deactivate_knowledge_doc(
 @router.get("/dashboard")
 async def dashboard(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Дашборд с метриками."""
     business_id = user["business_id"]
@@ -591,7 +621,7 @@ async def dashboard(
 @router.get("/dashboard/lost-leads")
 async def lost_leads_report(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
     period_days: int = 7,
 ) -> dict:
     """Отчёт «Потерянные заявки» за период."""
@@ -665,7 +695,7 @@ async def list_plans() -> list[dict]:
 @router.get("/billing/subscription")
 async def get_subscription(
     user: dict = Depends(get_current_user),
-    session: AsyncSession = None,  # type: ignore[assignment]
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Текущая подписка."""
     business_id = user["business_id"]

@@ -44,6 +44,9 @@ services:
   app:
     build: { context: ./backend }
     env_file: .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aiadmin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aiadmin}
       REDIS_URL: redis://redis:6379/0
@@ -65,10 +68,13 @@ services:
   worker:
     build: { context: ./backend }
     env_file: .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aiadmin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aiadmin}
       REDIS_URL: redis://redis:6379/0
-    command: ["/srv/app/.venv/bin/celery", "-A", "app.celery_app:celery", "worker", "--loglevel=info", "--concurrency=2"]
+    command: ["/srv/app/.venv/bin/celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -81,7 +87,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aiadmin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aiadmin}
       REDIS_URL: redis://redis:6379/0
-    command: ["/srv/app/.venv/bin/celery", "-A", "app.celery_app:celery", "beat", "--loglevel=info"]
+    command: ["/srv/app/.venv/bin/celery", "-A", "app.celery_app:celery_app", "beat", "--loglevel=info"]
     depends_on:
       redis: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
