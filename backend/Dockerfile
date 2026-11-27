@@ -14,6 +14,9 @@ WORKDIR /srv/app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Дополнительные пакеты, которые могли не попасть в uv.lock
+RUN uv pip install --python /srv/app/.venv/bin/python python-jose[cryptography]==3.3.0 python-multipart==0.0.18
+
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
